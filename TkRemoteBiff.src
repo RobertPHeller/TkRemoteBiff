@@ -1,0 +1,221 @@
+#*****************************************************************************
+#
+#  System        : 
+#  Module        : 
+#  Object Name   : $RCSfile$
+#  Revision      : $Revision$
+#  Date          : $Date$
+#  Author        : $Author$
+#  Created By    : Robert Heller
+#  Created       : Wed Jul 29 12:49:21 2020
+#  Last Modified : <201223.0938>
+#
+#  Description	
+#
+#  Notes
+#
+#  History
+#	
+#*****************************************************************************
+#
+#    Copyright (C) 2020  Robert Heller D/B/A Deepwoods Software
+#			51 Locke Hill Road
+#			Wendell, MA 01379-9728
+#
+#    This program is free software; you can redistribute it and/or modify
+#    it under the terms of the GNU General Public License as published by
+#    the Free Software Foundation; either version 2 of the License, or
+#    (at your option) any later version.
+#
+#    This program is distributed in the hope that it will be useful,
+#    but WITHOUT ANY WARRANTY; without even the implied warranty of
+#    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+#    GNU General Public License for more details.
+#
+#    You should have received a copy of the GNU General Public License
+#    along with this program; if not, write to the Free Software
+#    Foundation, Inc., 675 Mass Ave, Cambridge, MA 02139, USA.
+#
+# 
+#
+#*****************************************************************************
+
+set argv0 [file join [file dirname [info nameofexecutable]] [file rootname [file tail [info script]]]]
+
+
+package require Tk
+package require tile
+package require tls
+package require imap4
+set ::imap4::use_ssl 1
+
+package require snit
+
+package require ReadConfiguration
+package require IconImage
+
+
+
+namespace eval TkRemoteBiff {
+    snit::type Configuration {
+        ::ReadConfiguration::ConfigurationType \
+              {"Mail Server Host" mailServer string mail.deepsoft.com} \
+              {"User Name" userName string {}} \
+              {"Password" password string {}} \
+              {"New Mail Sound" newMail infile /usr/share/sounds/freedesktop/stereo/message.oga} \
+              {"New Mail Notifications" notify boolean false} \
+              {"Check Interface (seconds)" interval integer 30 {1 150 1}}
+    }
+    Configuration load
+    variable tlnum 0
+    variable Player [auto_execok play]
+    variable LastCheckMailCount 0
+    variable LastPopupY
+    variable PopupX
+    proc MailPopup {imessage} {
+        #puts stderr "*** TkRemoteBiff::MailPopup $imessage"
+        variable LastPopupY
+        variable tlnum
+        variable PopupX
+        set server [TkRemoteBiff::Configuration getoption mailServer]
+        set username [TkRemoteBiff::Configuration getoption userName]
+        set password [TkRemoteBiff::Configuration getoption password]
+        incr imessage
+        catch {
+            set chan [::imap4::open $server]
+            ::imap4::login $chan $username $password
+            ::imap4::examine $chan
+            ::imap4::fetch $chan $imessage:$imessage from: date: size subject:
+            set tlname [format {.mp%06d} [incr tlnum]]
+            #puts stderr "*** TkRemoteBiff::MailPopup: tlname = $tlname"
+            toplevel $tlname
+            wm overrideredirect $tlname yes
+            pack [message $tlname.message -aspect 1000 \
+                   -text [format {On %s, From %s: %s (%d bytes)} \
+                          [::imap4::msginfo $chan $imessage date:] \
+                          [::imap4::msginfo $chan $imessage from:] \
+                          [::imap4::msginfo $chan $imessage subject:] \
+                          [::imap4::msginfo $chan $imessage size]]] \
+                  -side left -expand yes -fill x
+            ::imap4::cleanup $chan
+            pack [label $tlname.dismis -text "X"] -side right
+            bind $tlname.dismis <Button> "destroy $tlname"
+            after 60000 [list catch "destroy $tlname"]
+            update idle
+            #puts stderr "*** TkRemoteBiff::MailPopup: built $tlname, LastPopupY = $LastPopupY"
+            wm geometry $tlname [format {+%d+%d} $PopupX $LastPopupY]
+            #puts "*** TkRemoteBiff::MailPopup: wm geometry $tlname is [wm geometry $tlname]"
+            #puts "*** TkRemoteBiff::MailPopup: winfo reqheight $tlname is [winfo reqheight $tlname]"
+            incr LastPopupY [winfo reqheight $tlname]
+            if {($LastPopupY + [winfo reqheight $tlname]) > [winfo screenheight $tlname]} {
+                scan [wm geometry .] {%dx%d+%d+%d} PopupX LastPopupY dummy dummy
+            }
+        }
+    }
+    proc CheckForMail {} {
+        variable Player
+        variable LastCheckMailCount
+        set server [TkRemoteBiff::Configuration getoption mailServer]
+        set username [TkRemoteBiff::Configuration getoption userName]
+        set password [TkRemoteBiff::Configuration getoption password]
+        catch {
+            set chan [::imap4::open $server]
+            ::imap4::login $chan $username $password
+            ::imap4::examine $chan
+            set newcount [::imap4::mboxinfo $chan EXISTS]
+            ::imap4::cleanup $chan
+            if {$newcount > $LastCheckMailCount} {
+                catch {exec $Player [TkRemoteBiff::Configuration getoption newMail]} result
+                #tk_messageBox -type ok -message $result -title $Player
+                if {[TkRemoteBiff::Configuration getoption notify]} {
+                    for {set i $LastCheckMailCount} {$i < $newcount} {incr i} {
+                        MailPopup $i
+                    }
+                }
+            }
+            #puts stderr "*** LastCheckMailCount = $LastCheckMailCount, newcount = $newcount"
+            if {$LastCheckMailCount != $newcount} {
+                if {$newcount > 0} {
+                    .status configure -image [IconImage image HaveMail]
+                } else {
+                    .status configure -image [IconImage image NoMail]
+                }
+                #puts stderr "*** .status cget -image is [.status cget -image]"
+            }
+            set LastCheckMailCount $newcount
+            .right entryconfigure "List Inbox*" -label [format {List Inbox (%d messages)} $LastCheckMailCount]
+        }
+        after [expr {[TkRemoteBiff::Configuration getoption interval] * 1000}] \
+              TkRemoteBiff::CheckForMail
+    }
+    variable InBoxList {}
+    proc CreateInBoxList {} {
+        toplevel .inboxlist
+        wm transient .inboxlist .
+        wm withdraw .inboxlist
+        pack [frame .inboxlist.lf] -fill both -expand yes
+        pack [ttk::treeview .inboxlist.lf.list \
+              -columns {index from date size subject} \
+              -displaycolumns {index from date size subject} \
+              -selectmode none \
+              -show headings] -side left -fill both -expand yes
+        .inboxlist.lf.list heading index -text {#} -anchor e
+        .inboxlist.lf.list heading from -text {From} -anchor w
+        .inboxlist.lf.list heading date -text {Date} -anchor w
+        .inboxlist.lf.list heading size -text {Size} -anchor e
+        .inboxlist.lf.list heading subject -text {Subject} -anchor w
+        .inboxlist.lf.list column index -stretch no  -anchor e -width 25
+        .inboxlist.lf.list column from -stretch no -anchor w -width 100
+        .inboxlist.lf.list column date -stretch no -anchor w -width 75
+        .inboxlist.lf.list column size -stretch no -anchor e -width 50
+        .inboxlist.lf.list column subject -stretch yes -anchor w -width 100
+        pack [scrollbar .inboxlist.lf.vscroll -orient vertical -command [list .inboxlist.lf.list yview]] -side right -fill y
+        .inboxlist.lf.list configure -yscrollcommand [list .inboxlist.lf.vscroll set]
+        pack [ttk::button .inboxlist.dismis -text "Dismis" \
+              -command [list wm withdraw .inboxlist]] -fill x
+        wm protocol .inboxlist WM_DELETE_WINDOW ".inboxlist.dismis invoke"
+        return .inboxlist
+    }
+    proc ListInBox {} {
+        variable InBoxList
+        if {$InBoxList eq {}} {
+            set InBoxList [CreateInBoxList]
+        }
+        $InBoxList.lf.list delete [$InBoxList.lf.list children {}]
+        set server [TkRemoteBiff::Configuration getoption mailServer]
+        set username [TkRemoteBiff::Configuration getoption userName]
+        set password [TkRemoteBiff::Configuration getoption password]
+        catch {
+            set chan [::imap4::open $server]
+            ::imap4::login $chan $username $password
+            ::imap4::examine $chan
+            set count [::imap4::mboxinfo $chan EXISTS]
+            if {$count > 0} {
+                ::imap4::fetch $chan 1: from: date: size subject:
+                for {set i 1} {$i <= $count} {incr i} {
+                    set record [list \
+                                [format {%d} $i] \
+                                [format {%s} [::imap4::msginfo $chan $i from:]] \
+                                [format {%s} [::imap4::msginfo $chan $i date:]] \
+                                [format {%d} [::imap4::msginfo $chan $i size]] \
+                                [format {%s} [::imap4::msginfo $chan $i subject:]]]
+                    $InBoxList.lf.list insert {} end -values $record
+                }
+            }
+            ::imap4::cleanup $chan
+        } 
+        wm deiconify $InBoxList
+    }
+    pack [ttk::label .status -image [IconImage image NoMail]]
+    menu .right -tearoff no
+    .right add command -label "Load Configuration" -command "TkRemoteBiff::Configuration load"
+    .right add command -label "Save Configuration" -command "TkRemoteBiff::Configuration save"
+    .right add command -label "Edit Configuration" -command "TkRemoteBiff::Configuration edit"
+    .right add command -label "List Inbox" -command "TkRemoteBiff::ListInBox"
+    .right add command -label "Quit" -command "exit"
+    .right add command -label "Dismis"
+    bind all <3> ".right post %X %Y"
+    update idle
+    scan [wm geometry .] {%dx%d+%d+%d} PopupX LastPopupY dummy dummy
+    TkRemoteBiff::CheckForMail
+}
